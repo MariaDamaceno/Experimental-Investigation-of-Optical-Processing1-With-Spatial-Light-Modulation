@@ -1,0 +1,380 @@
+"""
+Dual-SLM Optical System Simulation
+Master Thesis -
+
+Simulates polarization-controlled wavefront modulation using:
+- PyTorch for Fourier optics
+- Jones calculus for polarization
+- Angular Spectrum propagation method
+"""
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+import cv2
+import os
+from PIL import Image
+import torch.nn.functional as F
+
+# =============================
+# PHYSICAL PARAMETERS
+# =============================
+SLM_HEIGHT, SLM_WIDTH = 1000, 1900  # Native SLM resolution (pixels)
+SLM_HEIGHT_2, SLM_WIDTH_2 = int(0.85*SLM_HEIGHT), int(0.85*SLM_WIDTH)  # Reduced aperture
+SIM_SIZE = 4048  # Simulation grid size (must be larger than SLM)
+BLOCK_SIZE = 100  # Phase mask block size (pixels)
+
+# Physical constants
+PIXEL_PITCH = 7.4e-6  # SLM pixel pitch (m)
+WAVELENGTH = 781e-9  # Laser wavelength (m)
+WAVENUMBER = 2 * np.pi / WAVELENGTH  # Optical wavenumber
+
+# Optical path distances (m)
+D_SLM1_TO_LENS1 = 0.4
+D_LENS1_TO_SLM2 = 0.4
+D_SLM2_TO_LENS3 = 0.1
+
+# Lens focal lengths (m)
+F_LENS1 = 0.2
+F_LENS2 = 0.3
+
+
+# ==========================
+# CORE OPTICAL FUNCTIONS
+# ==========================
+
+def generate_phase_mask(height: int, width: int, block_size: int) -> torch.Tensor:
+    """
+    Generates a binary phase mask (0 or π) with random blocks
+    
+    Args:
+        height: Mask height in pixels
+        width: Mask width in pixels
+        block_size: Size of each random block in pixels
+        
+    Returns:
+        torch.Tensor: Phase mask in radians
+    """
+    n_blocks_y = height // block_size
+    n_blocks_x = width // block_size
+    random_blocks = torch.randint(0, 2, (n_blocks_y, n_blocks_x))
+    mask = torch.kron(random_blocks, torch.ones((block_size, block_size)))
+    return mask * np.pi
+
+
+def create_slm_mask(slm_shape: tuple, sim_size: int, block_size: int) -> torch.Tensor:
+    """
+    Creates centered SLM mask in simulation grid
+    
+    Args:
+        slm_shape: (height, width) of SLM in pixels
+        sim_size: Simulation grid size
+        block_size: Phase mask block size
+        
+    Returns:
+        torch.Tensor: Complex SLM mask
+    """
+    phase_mask = generate_phase_mask(*slm_shape, block_size)
+    slm_complex = torch.exp(1j * phase_mask)
+    
+    # Center in simulation grid
+    full_mask = torch.zeros((sim_size, sim_size), dtype=torch.complex64)
+    start_y = (sim_size - slm_shape[0]) // 2
+    start_x = (sim_size - slm_shape[1]) // 2
+    full_mask[start_y:start_y+slm_shape[0], start_x:start_x+slm_shape[1]] = slm_complex
+    
+    return full_mask
+
+
+def gaussian_beam(size_x: int, size_y: int, w0x: float, w0y: float) -> torch.Tensor:
+    """
+    Generates a 2D Gaussian beam profile
+    
+    Args:
+        size_x: Grid size in x-dimension
+        size_y: Grid size in y-dimension
+        w0x: Beam waist in x-direction (m)
+        w0y: Beam waist in y-direction (m)
+        
+    Returns:
+        torch.Tensor: Complex field amplitude
+    """
+    x = torch.linspace(-size_x//2, size_x//2-1, size_x) * PIXEL_PITCH
+    y = torch.linspace(-size_y//2, size_y//2-1, size_y) * PIXEL_PITCH
+    X, Y = torch.meshgrid(x, y, indexing='ij')
+    return torch.exp(-(X**2/w0x**2 + Y**2/w0y**2)).to(torch.complex64)
+
+
+def propagation_ASM(Uin: torch.Tensor, z: float, lambda_: float) -> torch.Tensor:
+    """
+    Angular Spectrum Method for optical propagation
+    
+    Args:
+        Uin: Input complex field
+        z: Propagation distance (m)
+        lambda_: Wavelength (m)
+        
+    Returns:
+        torch.Tensor: Propagated field
+    """
+    Nx, Ny = Uin.shape
+    fx = torch.fft.fftfreq(Nx, d=PIXEL_PITCH).to(Uin.device)
+    fy = torch.fft.fftfreq(Ny, d=PIXEL_PITCH).to(Uin.device)
+    FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+    
+    # Propagation kernel
+    H = torch.exp(1j * 2 * np.pi * z * torch.sqrt(1/lambda_**2 - FX**2 - FY**2))
+    
+    Uin_f = torch.fft.fft2(Uin)
+    Uout = torch.fft.ifft2(Uin_f * H)
+    
+    return Uout
+
+# ==========================
+# POLARIZATION COMPONENTS
+# ==========================
+
+def apply_pbs(E_field: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simulates a Polarizing Beam Splitter (PBS)
+    
+    Args:
+        E_field: Input electric field vector (Nx x Ny x 2)
+        
+    Returns:
+        tuple: (transmitted_h, reflected_v) fields
+    """
+    # Transmitted: Horizontal component
+    E_transmitted = E_field * torch.tensor([1, 0], dtype=torch.complex64)
+    # Reflected: Vertical component
+    E_reflected = E_field * torch.tensor([0, 1], dtype=torch.complex64)
+    return E_transmitted, E_reflected
+
+
+def apply_hwp(E_field: torch.Tensor, angle_deg: float = 22.5) -> torch.Tensor:
+    """
+    Applies a Half-Wave Plate (HWP) transformation
+    
+    Args:
+        E_field: Input electric field vector (Nx x Ny x 2)
+        angle_deg: Rotation angle in degrees
+        
+    Returns:
+        torch.Tensor: Transformed field
+    """
+    angle_rad = torch.deg2rad(torch.tensor(angle_deg))
+    theta = angle_rad
+    
+    # Jones matrix for HWP
+    j_hwp = torch.tensor([
+        [torch.cos(theta)**2 - torch.sin(theta)**2, 2*torch.cos(theta)*torch.sin(theta)],
+        [2*torch.cos(theta)*torch.sin(theta), torch.sin(theta)**2 - torch.cos(theta)**2]
+    ], dtype=torch.complex64)
+    
+    return torch.einsum('ij,...j->...i', j_hwp, E_field)
+
+
+def propagation_ASM_padded(Uin: torch.Tensor, 
+                          z: float, 
+                          lambda_: float, 
+                          pad_factor: int = 2) -> torch.Tensor:
+    """
+    Padded Angular Spectrum Method to prevent aliasing
+    
+    Args:
+        Uin: Input field (2D tensor)
+        z: Propagation distance (m)
+        lambda_: Wavelength (m)
+        pad_factor: Zero-padding factor
+        
+    Returns:
+        torch.Tensor: Propagated field
+    """
+    original_shape = Uin.shape
+    Nx, Ny = original_shape
+    N_pad = pad_factor * Nx
+    
+    # Zero-padding
+    pad_total = N_pad - Nx
+    pad_before = pad_total // 2
+    pad_after = pad_total - pad_before
+    Uin_pad = F.pad(Uin, (pad_before, pad_after, pad_before, pad_after))
+
+    # Frequency grids
+    fx = torch.fft.fftfreq(N_pad, d=PIXEL_PITCH).to(Uin.device)
+    fy = torch.fft.fftfreq(N_pad, d=PIXEL_PITCH).to(Uin.device)
+    FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+
+    # Propagation kernel with evanescent wave clipping
+    H = torch.exp(1j * 2 * np.pi * z * 
+                 torch.sqrt(torch.clamp(1/lambda_**2 - FX**2 - FY**2, min=0.0)))
+
+    # Propagation
+    Uin_f = torch.fft.fft2(Uin_pad)
+    Uout_pad = torch.fft.ifft2(Uin_f * H)
+
+    # Crop to original size
+    crop_start = pad_before
+    crop_end = crop_start + Nx
+    return Uout_pad[crop_start:crop_end, crop_start:crop_end]
+
+
+# ==========================
+# CAMERA SIMULATION
+# ==========================
+
+def simulate_camera_pixel_binning(intensity: torch.Tensor,
+                                sim_pixel_size: float = PIXEL_PITCH,
+                                camera_pixel_size: float = 5.04e-6) -> torch.Tensor:
+    """
+    Simulates camera pixel binning
+    
+    Args:
+        intensity: Input intensity pattern
+        sim_pixel_size: Simulation pixel size (m)
+        camera_pixel_size: Camera pixel size (m)
+        
+    Returns:
+        torch.Tensor: Binned intensity
+    """
+    bin_factor = int(camera_pixel_size / sim_pixel_size)
+    if bin_factor <= 1:
+        return intensity
+
+    return F.avg_pool2d(
+        intensity.unsqueeze(0).unsqueeze(0),
+        kernel_size=bin_factor
+    ).squeeze()
+
+# ==========================
+# VISUALIZATION FUNCTIONS
+# ==========================
+
+def plot_complex_field(U: torch.Tensor, title: str, vmax: float = None) -> None:
+    """
+    Plots amplitude and phase of complex field
+    
+    Args:
+        U: Input complex field
+        title: Plot title
+        vmax: Maximum value for intensity scaling
+    """
+    plt.figure(figsize=(12, 5))
+    
+    # Intensity plot
+    plt.subplot(1, 2, 1)
+    intensity = torch.abs(U)**2
+    plt.imshow(intensity.cpu().numpy(), cmap='inferno', vmax=vmax)
+    plt.title(f"{title} - Intensity")
+    plt.colorbar()
+    
+    # Phase plot
+    plt.subplot(1, 2, 2)
+    phase = torch.angle(U)
+    plt.imshow(phase.cpu().numpy(), cmap='twilight', vmin=-np.pi, vmax=np.pi)
+    plt.title(f"{title} - Phase")
+    plt.colorbar()
+    
+    plt.tight_layout()
+    os.makedirs('figures', exist_ok=True)
+    plt.savefig(f'figures/{title}.svg', dpi=300, format='svg')
+    plt.show()
+
+
+def plot_polarized_field(U: torch.Tensor, title: str) -> None:
+    """
+    Visualizes intensity and polarization angle
+    
+    Args:
+        U: Vector field (Nx x Ny x 2)
+        title: Plot title
+    """
+    intensity = torch.abs(U[..., 0])**2 + torch.abs(U[..., 1])**2
+    intensity = intensity / intensity.max()
+    
+    polarization_angle = 0.5 * torch.atan2(
+        2*torch.real(U[..., 0]*U[..., 1].conj()),
+        torch.abs(U[..., 0])**2 - torch.abs(U[..., 1])**2
+    )
+    
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    plt.imshow(intensity.cpu().numpy(), cmap='inferno')
+    plt.title(f"{title} - Intensity")
+    
+    plt.subplot(1, 2, 2)
+    plt.imshow(polarization_angle.cpu().numpy(), 
+              cmap='hsv', vmin=-np.pi/2, vmax=np.pi/2)
+    plt.title(f"{title} - Polarization Angle")
+    plt.colorbar()
+    
+    plt.show()
+
+
+# ==========================
+# MAIN SIMULATION
+# ==========================
+
+if __name__ == "__main__":
+    # 1. Create SLM masks
+    slm_mask = create_slm_mask((SLM_HEIGHT, SLM_WIDTH), SIM_SIZE, BLOCK_SIZE)
+    slm_mask_2 = create_slm_mask((SLM_HEIGHT, SLM_WIDTH), SIM_SIZE, BLOCK_SIZE)
+    
+    plot_complex_field(slm_mask, "SLM 1 Phase Mask")
+    plot_complex_field(slm_mask_2, "SLM 2 Phase Mask")
+    
+    # 2. Initialize Gaussian beam with diagonal polarization
+    gauss = gaussian_beam(SIM_SIZE, SIM_SIZE, 0.022, 0.036)
+    U = torch.stack([gauss, gauss], dim=-1) / np.sqrt(2)  # Diagonal polarization
+    plot_polarized_field(U, "Input Beam - Diagonal Polarization")
+
+    # 3. SLM1 modulation (horizontal component only)
+    U[..., 0] *= slm_mask
+    plot_polarized_field(U, "After SLM1 (H modulation)")
+    
+    # 4. Propagation to Lens1
+    U = apply_propagation_vectorial(U, D_SLM1_TO_LENS1, WAVELENGTH)
+    plot_polarized_field(U, "After 40cm propagation")
+    
+    # 5. Apply Lens1
+    U = apply_lens_vectorial(U, F_LENS1, WAVELENGTH)
+    plot_polarized_field(U, "After Lens1")
+    
+    # 6. Propagation to SLM2
+    U = apply_propagation_vectorial(U, D_LENS1_TO_SLM2, WAVELENGTH)
+    plot_polarized_field(U, "Before SLM2")
+    
+    # 7. SLM2 modulation (vertical component only)
+    U[..., 1] *= slm_mask_2
+    plot_polarized_field(U, "After SLM2 (V modulation)")
+    
+    # 8. Propagation to Lens2
+    U = apply_propagation_vectorial(U, D_SLM2_TO_LENS3, WAVELENGTH)
+    plot_polarized_field(U, "After 10cm propagation")
+    
+    # 9. Apply Lens2
+    U = apply_lens_vectorial(U, F_LENS2, WAVELENGTH)
+    plot_polarized_field(U, "After Lens2")
+    
+    # 10. HWP transformation
+    U = apply_hwp(U, angle_deg=22.5)
+    plot_polarized_field(U, "After HWP (22.5°)")
+    
+    # 11. PBS separation
+    U_transmitted, _ = apply_pbs(U)
+    plot_polarized_field(U_transmitted, "PBS Transmitted (H)")
+    
+    # 12. Final propagation to camera
+    U_final = apply_propagation_vectorial(U_transmitted, D_LENS1_TO_CAMERA, WAVELENGTH)
+    
+    # 13. Camera simulation
+    intensity = (torch.abs(U_final[..., 0])**2 + torch.abs(U_final[..., 1])**2)
+    intensity_binned = simulate_camera_pixel_binning(intensity)
+    intensity_normalized = (intensity_binned / intensity_binned.max() * 255).type(torch.uint8)
+    
+    # Save result
+    Image.fromarray(intensity_normalized.cpu().numpy()).save('simulated_camera_image.png')
+    print("Simulation complete! Output saved as simulated_camera_image.png")
+    
